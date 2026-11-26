@@ -2,6 +2,7 @@ package com.novibe.dns.next_dns.service;
 
 import com.novibe.common.base_structures.BypassRoute;
 import com.novibe.common.service.ExcludeRedirectCheckService;
+import com.novibe.common.exception.ProfileSetupException;
 import com.novibe.common.util.Log;
 import com.novibe.dns.next_dns.http.NextDnsRewriteClient;
 import com.novibe.dns.next_dns.http.dto.request.CreateRewriteDto;
@@ -11,14 +12,26 @@ import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Comparator;
+import java.util.Set;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 
-import static java.util.Objects.nonNull;
 
 @Service
 @RequiredArgsConstructor
 public class NextDnsRewriteService {
+
+    private static final int MAX_REWRITES = 480;
+    private static final Set<String> PRIORITY_DOMAINS = Set.of(
+            "chatgpt.com", "openai.com", "oaistatic.com", "oaiusercontent.com",
+            "claude.ai", "anthropic.com", "gemini.google.com",
+            "youtube.com", "youtu.be", "googlevideo.com", "ytimg.com", "youtubei.googleapis.com");
+
+    private static boolean priority(String domain) {
+        return PRIORITY_DOMAINS.stream().anyMatch(root -> domain.equals(root) || domain.endsWith("." + root));
+    }
 
     private final NextDnsRewriteClient nextDnsRewriteClient;
     private final ExcludeRedirectCheckService excludeRedirectCheckService;
@@ -30,37 +43,45 @@ public class NextDnsRewriteService {
     }
 
     public List<CreateRewriteDto> cleanupOutdatedAndExcluded(Map<String, CreateRewriteDto> newRewriteRequests) {
+        // This profile is managed exclusively by DnsConf.
+        if (newRewriteRequests.isEmpty()) {
+            throw new ProfileSetupException("Empty redirect list; refusing to modify NextDNS");
+        }
+        Map<String, CreateRewriteDto> desired = new HashMap<>();
+        newRewriteRequests.entrySet().stream()
+                .filter(entry -> !excludeRedirectCheckService.shouldExclude(entry.getKey()))
+                .sorted(Comparator.<Map.Entry<String, CreateRewriteDto>, Boolean>comparing(
+                        entry -> !priority(entry.getKey())).thenComparing(Map.Entry::getKey))
+                .limit(MAX_REWRITES)
+                .forEachOrdered(entry -> desired.put(entry.getKey(), entry.getValue()));
+        if (desired.isEmpty()) {
+            throw new ProfileSetupException("No eligible redirects; refusing to modify NextDNS");
+        }
+
         List<RewriteDto> existingRewrites = getExistingRewrites();
-
-        List<String> outdatedIds = new ArrayList<>();
-        List<String> ignoredIds = new ArrayList<>();
-
-        for (RewriteDto existingRewrite : existingRewrites) {
-            String domain = existingRewrite.name();
-            String oldIp = existingRewrite.content();
-            if (excludeRedirectCheckService.shouldExclude(domain)) {
-                ignoredIds.add(existingRewrite.id());
-                newRewriteRequests.remove(domain);
+        Set<String> retained = new HashSet<>();
+        List<String> removeIds = new ArrayList<>();
+        for (RewriteDto existing : existingRewrites) {
+            CreateRewriteDto request = desired.get(existing.name());
+            if (request != null && request.content().equals(existing.content())
+                    && retained.add(existing.name())) {
                 continue;
             }
-            CreateRewriteDto request = newRewriteRequests.get(domain);
-            if (nonNull(request) && !request.content().equals(oldIp)) {
-                outdatedIds.add(existingRewrite.id());
-            } else {
-                newRewriteRequests.remove(domain);
-            }
+            removeIds.add(existing.id());
         }
-        newRewriteRequests.keySet().removeIf(excludeRedirectCheckService::shouldExclude);
-
-        if (!outdatedIds.isEmpty()) {
-            Log.io("Removing %s outdated rewrites from NextDNS".formatted(outdatedIds.size()));
-            nextDnsRewriteClient.deleteRewritesByIds(outdatedIds);
+        List<CreateRewriteDto> additions = desired.entrySet().stream()
+                .filter(entry -> !retained.contains(entry.getKey()))
+                .sorted(Comparator.<Map.Entry<String, CreateRewriteDto>, Boolean>comparing(
+                        entry -> !priority(entry.getKey())).thenComparing(Map.Entry::getKey))
+                .map(Map.Entry::getValue)
+                .toList();
+        Log.common("NextDNS: source=%s, target=%s, retained=%s, delete=%s, create=%s, omitted=%s"
+                .formatted(newRewriteRequests.size(), desired.size(), retained.size(),
+                        removeIds.size(), additions.size(), newRewriteRequests.size() - desired.size()));
+        if (!removeIds.isEmpty()) {
+            nextDnsRewriteClient.deleteRewritesByIds(removeIds);
         }
-        if (!ignoredIds.isEmpty()) {
-            Log.io("Removing %s excluded rewrites from NextDNS".formatted(ignoredIds.size()));
-            nextDnsRewriteClient.deleteRewritesByIds(ignoredIds);
-        }
-        return List.copyOf(newRewriteRequests.values());
+        return additions;
     }
 
     public List<RewriteDto> getExistingRewrites() {

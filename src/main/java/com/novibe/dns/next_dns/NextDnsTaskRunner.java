@@ -2,6 +2,7 @@ package com.novibe.dns.next_dns;
 
 import com.novibe.common.DnsTaskRunner;
 import com.novibe.common.base_structures.BypassRoute;
+import com.novibe.common.exception.ProfileSetupException;
 import com.novibe.common.util.DonorDnsUtils;
 import com.novibe.common.util.EnvParser;
 import com.novibe.common.util.Log;
@@ -11,6 +12,7 @@ import com.novibe.dns.next_dns.service.NextDnsRewriteService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -30,10 +32,11 @@ public class NextDnsTaskRunner extends DnsTaskRunner {
         Log.global("Setting up Profile " + dnsProfile.number() + " (NextDNS)");
         Log.common("""
                 Script behaviour: old BLOCK/REDIRECT settings are about to be updated via provided BLOCK/REDIRECT sources.
-                - if no sources provided, then all NextDNS settings will be removed.
+                - if no sources are provided, existing NextDNS settings are preserved.
                 - each line is mapped to an IP–domain pair; lines that cannot be parsed are skipped.
                 - if provided only one type of sources, related settings will be updated; another type remain untouched.
-                - if EXCLUDE_REDIRECT domains provided, they will affect both existing and new redirect rules.
+                - REDIRECT is authoritative for this dedicated profile; keep up to 480 prioritized rewrites.
+                - empty or failed redirect sources stop synchronization before rewrites are modified.
                 NextDNS api rate limiter reset config: 60 seconds after the last request""");
     }
 
@@ -56,7 +59,14 @@ public class NextDnsTaskRunner extends DnsTaskRunner {
         if (!rewriteSources.isEmpty()) {
 
             Log.step("Obtain rewrite lists from %s sources".formatted(rewriteSources.size()));
-            List<BypassRoute> overrides = overrideListsLoader.fetchWebsites(rewriteSources);
+            List<BypassRoute> overrides = new ArrayList<>();
+            for (String source : rewriteSources) {
+                List<BypassRoute> routes = overrideListsLoader.fetchWebsites(List.of(source));
+                if (routes.isEmpty()) {
+                    throw new ProfileSetupException("Redirect source returned no usable records: " + source);
+                }
+                overrides.addAll(routes);
+            }
 
             if (nonNull(dnsProfile.donorDns())) {
                 Log.step("Replace IP of domains via IPs from " + dnsProfile.donorDns());
@@ -74,9 +84,7 @@ public class NextDnsTaskRunner extends DnsTaskRunner {
         }
 
         if (blockSources.isEmpty() && rewriteSources.isEmpty()) {
-            Log.step("Remove settings");
-            nextDnsDenyService.removeAll();
-            nextDnsRewriteService.removeAll();
+            throw new ProfileSetupException("No DNS sources configured; preserving existing settings");
         }
     }
 
